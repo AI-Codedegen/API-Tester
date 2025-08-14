@@ -39,6 +39,10 @@ import shlex
 import socket
 import sys
 import time
+import tempfile
+import io
+import zipfile
+import shutil
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -712,7 +716,7 @@ def _pick_port(host: str, preferred: int, attempts: int = 20) -> int:
 
 
 def run_ui(host: str, port: int):
-    from flask import Flask, request, jsonify
+    from flask import Flask, request, jsonify, send_file
 
     app = Flask(__name__)
 
@@ -790,6 +794,11 @@ def run_ui(host: str, port: int):
   <p>Dán lệnh <code>curl</code> (đầy đủ method, headers, body, URL) rồi bấm <b>Chạy test</b>.</p>
   <textarea id=\"curl\" placeholder=\"curl -X POST https://api.example.com/v1/things -H 'Authorization: Bearer xxxxx' -H 'Content-Type: application/json' -d '{\\"name\\":\\"abc\\"}'\"></textarea>
   <div class=\"row\" style=\"margin-top:8px\">
+    <input id=\"token\" type=\"text\" placeholder=\"Authorization token (optional)\" style=\"flex:1;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--card);color:var(--fg);\" />
+    <input id=\"dlUrl\" type=\"text\" placeholder=\"URL script kiểm thử\" style=\"flex:1;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--card);color:var(--fg);\" />
+    <button id=\"dlBtn\" class=\"btn btn-secondary\" onclick=\"downloadScript()\">Tải script</button>
+  </div>
+  <div class=\"row\" style=\"margin-top:8px\">
     <button id=\"runBtn\" class=\"btn\" onclick=\"run()\">Chạy test</button>
     <small id=\"hint\" style=\"color:var(--muted)\">Mẹo: bạn có thể dán trực tiếp cả lệnh <code>curl</code>.</small>
   </div>
@@ -825,6 +834,7 @@ async function run(){
   const loader = document.getElementById('loading');
   const el = document.getElementById('result');
   const curl = document.getElementById('curl').value;
+  const token = document.getElementById('token').value;
 
   // UI state
   runBtn.disabled = true;
@@ -833,7 +843,7 @@ async function run(){
   el.innerHTML = '';
 
   try{
-    const res = await fetch('/run', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({curl, timeout: 30})});
+    const res = await fetch('/run', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({curl, timeout: 30, token})});
     const data = await res.json();
 
     if (data.error){
@@ -880,6 +890,31 @@ async function run(){
   }
 }
 
+async function downloadScript(){
+  const url = document.getElementById('dlUrl').value;
+  const token = document.getElementById('token').value;
+  if(!url){
+    alert('Vui lòng nhập URL script');
+    return;
+  }
+  try{
+    const res = await fetch('/download', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url, token})});
+    if(!res.ok){
+      alert('Tải script thất bại');
+      return;
+    }
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'api_test_script.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }catch(err){
+    alert('Lỗi: ' + err);
+  }
+}
+
 function escapeHtml(unsafe){
   return String(unsafe)
     .replaceAll('&','&amp;')
@@ -915,6 +950,28 @@ function escapeHtml(unsafe){
             return jsonify(result)
         except Exception as e:  # pragma: no cover
             return jsonify({"error": str(e)}), 400
+
+    @app.post("/download")
+    def download():
+        from flask import request, jsonify
+        payload = request.get_json(silent=True) or {}
+        url = payload.get("url")
+        token = payload.get("token")
+        if not url:
+            return jsonify({"error": "Thiếu trường 'url'."}), 400
+        tmpdir = tempfile.mkdtemp()
+        try:
+            script_path, instr_path = download_test_script(url, dest_dir=tmpdir, token=token)
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.write(script_path, arcname=os.path.basename(script_path))
+                zf.write(instr_path, arcname=os.path.basename(instr_path))
+            buf.seek(0)
+            return send_file(buf, mimetype="application/zip", as_attachment=True, download_name="api_test_script.zip")
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     # Thử nhiều host/port để tránh SystemExit:1 do bind thất bại
     host_candidates = [host or DEFAULT_HOST, DEFAULT_HOST, "127.0.0.1", "localhost"]
