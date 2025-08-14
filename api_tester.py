@@ -39,6 +39,10 @@ import shlex
 import socket
 import sys
 import time
+import tempfile
+import io
+import zipfile
+import shutil
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -90,6 +94,28 @@ class TestResult:
 DEFAULT_TIMEOUT = int(os.getenv("API_TESTER_TIMEOUT", "30"))
 DEFAULT_PORT = int(os.getenv("PORT", "8787"))
 DEFAULT_HOST = os.getenv("BIND_HOST", "0.0.0.0")
+
+# Cache cho token Authorization (dùng lại cho các request tiếp theo)
+_AUTH_TOKEN_CACHE: Optional[str] = None
+
+
+def _apply_auth_token(headers: Dict[str, str]) -> Dict[str, str]:
+    """Bổ sung/ghi nhớ header Authorization."""
+    global _AUTH_TOKEN_CACHE
+    headers = headers or {}
+    existing = headers.get("Authorization") or headers.get("authorization")
+    if existing:
+        _AUTH_TOKEN_CACHE = existing
+        return headers
+    if _AUTH_TOKEN_CACHE and "Authorization" not in headers and "authorization" not in headers:
+        headers = headers.copy()
+        headers["Authorization"] = _AUTH_TOKEN_CACHE
+    return headers
+
+
+def _clear_auth_token() -> None:
+    global _AUTH_TOKEN_CACHE
+    _AUTH_TOKEN_CACHE = None
 
 # --------------------------
 # cURL parser đơn giản (dùng shlex)
@@ -406,12 +432,15 @@ def mask_sensitive(h: Dict[str, str]) -> Dict[str, str]:
 
 
 def send_request(method: str, url: str, headers: Dict[str, str], body: Optional[str], verify_ssl: bool, timeout: int) -> Tuple[int, int, str]:
+    headers = _apply_auth_token(headers or {})
     start = time.time()
     try:
         resp = requests.request(method=method, url=url, headers=headers or None,
                                 data=body if body is not None else None,
                                 timeout=timeout, verify=verify_ssl)
         elapsed_ms = int((time.time() - start) * 1000)
+        if resp.status_code in (401, 403):
+            _clear_auth_token()
         preview = resp.text
         if len(preview) > 800:
             preview = preview[:800] + "..."
@@ -440,8 +469,38 @@ def evaluate(expect: Dict[str, Any], status: int) -> Tuple[bool, str]:
     return True, "Không có kỳ vọng cụ thể"
 
 
-def run_cases(curl_cmd: str, out_prefix: Optional[str] = None, serve_mode: bool = False, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+def download_test_script(url: str, dest_dir: str = ".", filename: Optional[str] = None,
+                         token: Optional[str] = None) -> Tuple[str, str]:
+    """Tải script kiểm thử và ghi hướng dẫn chạy local.
+
+    Trả về (đường dẫn script, đường dẫn hướng dẫn)."""
+    if not filename:
+        filename = os.path.basename(url) or "api_test.py"
+    script_path = os.path.join(dest_dir, filename)
+    headers: Dict[str, str] = {}
+    if token:
+        headers["Authorization"] = token
+    headers = _apply_auth_token(headers)
+    resp = requests.get(url, headers=headers or None)
+    if resp.status_code in (401, 403):
+        _clear_auth_token()
+    resp.raise_for_status()
+    with open(script_path, "wb") as f:
+        f.write(resp.content)
+    instruction_path = script_path + ".md"
+    with open(instruction_path, "w", encoding="utf-8") as f:
+        f.write("# Hướng dẫn chạy script\n\n")
+        f.write(f"Chạy bằng:\n\n```bash\npython {os.path.basename(script_path)}\n```\n")
+    return script_path, instruction_path
+
+
+def run_cases(curl_cmd: str, out_prefix: Optional[str] = None, serve_mode: bool = False,
+              timeout: int = DEFAULT_TIMEOUT, auth_token: Optional[str] = None) -> Dict[str, Any]:
     pc = parse_curl(curl_cmd)
+    if auth_token:
+        _apply_auth_token({"Authorization": auth_token})
+    else:
+        _apply_auth_token(pc.headers)
     cases = generate_testcases(pc)
 
     results: List[TestResult] = []
@@ -657,7 +716,7 @@ def _pick_port(host: str, preferred: int, attempts: int = 20) -> int:
 
 
 def run_ui(host: str, port: int):
-    from flask import Flask, request, jsonify
+    from flask import Flask, request, jsonify, send_file
 
     app = Flask(__name__)
 
@@ -735,6 +794,11 @@ def run_ui(host: str, port: int):
   <p>Dán lệnh <code>curl</code> (đầy đủ method, headers, body, URL) rồi bấm <b>Chạy test</b>.</p>
   <textarea id=\"curl\" placeholder=\"curl -X POST https://api.example.com/v1/things -H 'Authorization: Bearer xxxxx' -H 'Content-Type: application/json' -d '{\\"name\\":\\"abc\\"}'\"></textarea>
   <div class=\"row\" style=\"margin-top:8px\">
+    <input id=\"token\" type=\"text\" placeholder=\"Authorization token (optional)\" style=\"flex:1;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--card);color:var(--fg);\" />
+    <input id=\"dlUrl\" type=\"text\" placeholder=\"URL script kiểm thử\" style=\"flex:1;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--card);color:var(--fg);\" />
+    <button id=\"dlBtn\" class=\"btn btn-secondary\" onclick=\"downloadScript()\">Tải script</button>
+  </div>
+  <div class=\"row\" style=\"margin-top:8px\">
     <button id=\"runBtn\" class=\"btn\" onclick=\"run()\">Chạy test</button>
     <small id=\"hint\" style=\"color:var(--muted)\">Mẹo: bạn có thể dán trực tiếp cả lệnh <code>curl</code>.</small>
   </div>
@@ -770,6 +834,7 @@ async function run(){
   const loader = document.getElementById('loading');
   const el = document.getElementById('result');
   const curl = document.getElementById('curl').value;
+  const token = document.getElementById('token').value;
 
   // UI state
   runBtn.disabled = true;
@@ -778,7 +843,7 @@ async function run(){
   el.innerHTML = '';
 
   try{
-    const res = await fetch('/run', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({curl, timeout: 30})});
+    const res = await fetch('/run', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({curl, timeout: 30, token})});
     const data = await res.json();
 
     if (data.error){
@@ -825,6 +890,31 @@ async function run(){
   }
 }
 
+async function downloadScript(){
+  const url = document.getElementById('dlUrl').value;
+  const token = document.getElementById('token').value;
+  if(!url){
+    alert('Vui lòng nhập URL script');
+    return;
+  }
+  try{
+    const res = await fetch('/download', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url, token})});
+    if(!res.ok){
+      alert('Tải script thất bại');
+      return;
+    }
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'api_test_script.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }catch(err){
+    alert('Lỗi: ' + err);
+  }
+}
+
 function escapeHtml(unsafe){
   return String(unsafe)
     .replaceAll('&','&amp;')
@@ -852,13 +942,36 @@ function escapeHtml(unsafe){
         payload = request.get_json(silent=True) or {}
         curl = payload.get("curl")
         timeout = int(payload.get("timeout") or DEFAULT_TIMEOUT)
+        token = request.headers.get("Authorization") or payload.get("token")
         if not curl:
             return jsonify({"error": "Thiếu trường 'curl' trong payload."}), 400
         try:
-            result = run_cases(curl, out_prefix=None, serve_mode=True, timeout=timeout)
+            result = run_cases(curl, out_prefix=None, serve_mode=True, timeout=timeout, auth_token=token)
             return jsonify(result)
         except Exception as e:  # pragma: no cover
             return jsonify({"error": str(e)}), 400
+
+    @app.post("/download")
+    def download():
+        from flask import request, jsonify
+        payload = request.get_json(silent=True) or {}
+        url = payload.get("url")
+        token = payload.get("token")
+        if not url:
+            return jsonify({"error": "Thiếu trường 'url'."}), 400
+        tmpdir = tempfile.mkdtemp()
+        try:
+            script_path, instr_path = download_test_script(url, dest_dir=tmpdir, token=token)
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.write(script_path, arcname=os.path.basename(script_path))
+                zf.write(instr_path, arcname=os.path.basename(instr_path))
+            buf.seek(0)
+            return send_file(buf, mimetype="application/zip", as_attachment=True, download_name="api_test_script.zip")
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     # Thử nhiều host/port để tránh SystemExit:1 do bind thất bại
     host_candidates = [host or DEFAULT_HOST, DEFAULT_HOST, "127.0.0.1", "localhost"]
@@ -913,6 +1026,8 @@ def main():
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Timeout mỗi request (giây)")
     p.add_argument("--ui", action="store_true", help="Chạy UI (Flask)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port UI (mặc định 8787; 0 = random)")
+    p.add_argument("--download", type=str, help="Tải script kiểm thử từ URL và thoát")
+    p.add_argument("--token", type=str, help="Authorization token (tuỳ chọn)")
 
     # Không tham số → mở UI (tự chọn host/port)
     if len(sys.argv) == 1:
@@ -921,6 +1036,12 @@ def main():
         return
 
     args = p.parse_args()
+
+    if args.download:
+        script_path, instr_path = download_test_script(args.download, token=args.token)
+        print(f"Đã tải script: {script_path}")
+        print(f"Hướng dẫn: {instr_path}")
+        return
 
     if args.ui:
         run_ui(host=DEFAULT_HOST, port=args.port)
@@ -945,7 +1066,7 @@ def main():
         )
         return
 
-    out = run_cases(curl_cmd, out_prefix=args.out, timeout=args.timeout)
+    out = run_cases(curl_cmd, out_prefix=args.out, timeout=args.timeout, auth_token=args.token)
     s = out["summary"]
     print(f"Tổng: {s['total']} · PASS: {s['passed']} · FAIL: {s['failed']} · Thời gian: {s['duration_ms']} ms")
     print(f"Đã ghi báo cáo: {args.out}.json, {args.out}.md, {args.out}.html")
